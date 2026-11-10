@@ -1,0 +1,23 @@
+# Build
+*.obj
+*.exe
+*.exe.disabled
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+build/
+out/
+.vs/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Local / OS
+*.lnk
+*.log
+.DS_Store
+Thumbs.db
+
+# Runtime settings live in %LOCALAPPDATA%\PulseWatch
