@@ -2,6 +2,8 @@
 
 Telemetria nativa do Windows: AppBar no topo com rede, CPU, RAM, GPU e ventoinha.
 
+![PulseWatch em funcionamento](docs/pulsewatch-bar.gif)
+
 ## Identidade
 
 - **Marca:** glyph ECG em Signal Teal (`#2F9E8A`) — sem wordmark na barra

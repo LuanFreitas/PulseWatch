@@ -25,8 +25,11 @@
 constexpr UINT kBarQuiet = 32;
 constexpr UINT kBarFocus = 40;
 constexpr UINT_PTR kTimer = 1;
+constexpr UINT_PTR kFocusTimer = 2;
+constexpr UINT kFocusPollMs = 100;
 constexpr UINT kAppBarMessage = WM_APP + 1;
 constexpr UINT kTrayMessage = WM_APP + 2;
+constexpr UINT kFocusCheckMessage = WM_APP + 3;
 constexpr UINT kExitCommand = 1001;
 constexpr UINT kAboutCommand = 1002;
 constexpr UINT kThemeLightCommand = 1010;
@@ -101,6 +104,10 @@ IDWriteTextFormat* g_metricCritFormat{};
 IDWriteTextFormat* g_sparkTitleFormat{};
 IDWriteTextFormat* g_sparkValueFormat{};
 bool g_appbarRegistered{};
+bool g_yieldedForFocus{};
+int g_fullscreenClearStreak{};
+HWINEVENTHOOK g_focusHook{};
+HWINEVENTHOOK g_moveHook{};
 ULONGLONG g_rx{}, g_tx{}, g_idle{}, g_kernel{}, g_user{}, g_lastTick{};
 double g_down{}, g_up{}, g_cpu{};
 DWORD g_ram{};
@@ -367,6 +374,167 @@ BOOL CALLBACK FindConfiguredMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM data) 
     const bool fallback = g_settings.monitorDevice.empty() && (info.dwFlags & MONITORINFOF_PRIMARY);
     if (wanted || fallback) { *reinterpret_cast<RECT*>(data) = info.rcMonitor; return FALSE; }
     return TRUE;
+}
+
+bool GetBarMonitor(MONITORINFOEXW& info) {
+    info = { sizeof(info) };
+    RECT monitorRect{};
+    EnumDisplayMonitors(nullptr, nullptr, FindConfiguredMonitor, reinterpret_cast<LPARAM>(&monitorRect));
+    if (IsRectEmpty(&monitorRect)) {
+        g_settings.monitorDevice.clear();
+        EnumDisplayMonitors(nullptr, nullptr, FindConfiguredMonitor, reinterpret_cast<LPARAM>(&monitorRect));
+    }
+    if (IsRectEmpty(&monitorRect)) return false;
+    const HMONITOR handle = MonitorFromRect(&monitorRect, MONITOR_DEFAULTTONEAREST);
+    return GetMonitorInfoW(handle, &info) != FALSE;
+}
+
+bool IsShellOrDesktopWindow(HWND hwnd) {
+    if (!hwnd) return true;
+    wchar_t className[64]{};
+    GetClassNameW(hwnd, className, ARRAYSIZE(className));
+    return _wcsicmp(className, L"Progman") == 0 ||
+           _wcsicmp(className, L"WorkerW") == 0 ||
+           _wcsicmp(className, L"Shell_TrayWnd") == 0 ||
+           _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
+           _wcsicmp(className, L"PulseWatchTopBar") == 0 ||
+           _wcsicmp(className, L"PulseWatchSpark") == 0;
+}
+
+bool RectCoversMonitor(const RECT& windowRect, const RECT& monitorRect) {
+    constexpr LONG slack = 4;
+    return windowRect.left <= monitorRect.left + slack &&
+           windowRect.top <= monitorRect.top + slack &&
+           windowRect.right >= monitorRect.right - slack &&
+           windowRect.bottom >= monitorRect.bottom - slack;
+}
+
+bool IsFullscreenCandidate(HWND hwnd, const MONITORINFOEXW& barMonitor) {
+    if (!hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd) || IsShellOrDesktopWindow(hwnd)) return false;
+    if (GetWindow(hwnd, GW_OWNER)) return false;
+
+    const HMONITOR windowMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    if (!windowMonitor) return false;
+    MONITORINFOEXW windowInfo{ sizeof(windowInfo) };
+    if (!GetMonitorInfoW(windowMonitor, &windowInfo)) return false;
+    if (wcscmp(windowInfo.szDevice, barMonitor.szDevice) != 0) return false;
+
+    RECT windowRect{};
+    if (!GetWindowRect(hwnd, &windowRect)) return false;
+    if (!RectCoversMonitor(windowRect, barMonitor.rcMonitor)) return false;
+
+    const LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    const LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    const bool bordered = (style & WS_CAPTION) != 0 || (style & WS_THICKFRAME) != 0;
+    const bool toolWindow = (exStyle & WS_EX_TOOLWINDOW) != 0;
+    if (toolWindow && bordered) return false;
+
+    // Maximized desktop apps keep chrome; true focus surfaces are borderless / cover the monitor.
+    if (bordered && (style & WS_MAXIMIZE)) return false;
+    return !bordered || RectCoversMonitor(windowRect, barMonitor.rcMonitor);
+}
+
+bool ShouldYieldToFullscreen() {
+    QUERY_USER_NOTIFICATION_STATE state = QUNS_ACCEPTS_NOTIFICATIONS;
+    if (SUCCEEDED(SHQueryUserNotificationState(&state))) {
+        if (state == QUNS_RUNNING_D3D_FULL_SCREEN ||
+            state == QUNS_PRESENTATION_MODE ||
+            state == QUNS_BUSY) {
+            return true;
+        }
+    }
+
+    MONITORINFOEXW barMonitor{};
+    if (!GetBarMonitor(barMonitor)) return false;
+
+    HWND foreground = GetForegroundWindow();
+    if (IsFullscreenCandidate(foreground, barMonitor)) return true;
+
+    // Some browsers keep a child focused; climb to the root ownerless frame.
+    if (foreground) {
+        HWND root = GetAncestor(foreground, GA_ROOT);
+        if (root && root != foreground && IsFullscreenCandidate(root, barMonitor)) return true;
+    }
+    return false;
+}
+
+void CloseSparkWindow();
+void PositionAppBar();
+void RemoveAppBar();
+
+void UpdateTrayTip(bool yielded) {
+    if (!g_tray.hWnd) return;
+    if (yielded) {
+        lstrcpynW(g_tray.szTip, L"PulseWatch · oculto (tela cheia)", ARRAYSIZE(g_tray.szTip));
+    } else {
+        lstrcpynW(g_tray.szTip, L"PulseWatch · Signal Quiet — Ctrl+Alt+Shift+P encerra", ARRAYSIZE(g_tray.szTip));
+    }
+    Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+}
+
+void YieldBarForFocus() {
+    if (g_yieldedForFocus) return;
+    g_yieldedForFocus = true;
+    CloseSparkWindow();
+    ShowWindow(g_window, SW_HIDE);
+    RemoveAppBar();
+    UpdateTrayTip(true);
+    WriteDiagnostic(L"Yielded bar for fullscreen focus");
+}
+
+void RestoreBarFromFocus() {
+    if (!g_yieldedForFocus) return;
+    g_yieldedForFocus = false;
+    g_appbar = { sizeof(APPBARDATA) };
+    g_appbar.hWnd = g_window;
+    g_appbar.uCallbackMessage = kAppBarMessage;
+    g_appbarRegistered = SHAppBarMessage(ABM_NEW, &g_appbar) != 0;
+    if (!g_appbarRegistered) {
+        WriteDiagnostic(L"AppBar re-registration failed after fullscreen");
+        return;
+    }
+    ShowWindow(g_window, SW_SHOWNOACTIVATE);
+    PositionAppBar();
+    UpdateTrayTip(false);
+    InvalidateRect(g_window, nullptr, TRUE);
+    WriteDiagnostic(L"Restored bar after fullscreen focus");
+}
+
+void UpdateFocusYield() {
+    const bool wantYield = ShouldYieldToFullscreen();
+    if (wantYield) {
+        g_fullscreenClearStreak = 0;
+        YieldBarForFocus();
+        return;
+    }
+
+    // Restore with a short clear streak so Alt+Tab blips do not flicker the bar.
+    if (g_fullscreenClearStreak < 2) ++g_fullscreenClearStreak;
+    if (g_fullscreenClearStreak >= 2) RestoreBarFromFocus();
+}
+
+void CALLBACK FocusWinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    if (g_window) PostMessageW(g_window, kFocusCheckMessage, 0, 0);
+}
+
+void InstallFocusHooks() {
+    if (!g_focusHook) {
+        g_focusHook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+            nullptr, FocusWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    if (!g_moveHook) {
+        g_moveHook = SetWinEventHook(
+            EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND,
+            nullptr, FocusWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+}
+
+void RemoveFocusHooks() {
+    if (g_focusHook) { UnhookWinEvent(g_focusHook); g_focusHook = nullptr; }
+    if (g_moveHook) { UnhookWinEvent(g_moveHook); g_moveHook = nullptr; }
 }
 
 template <typename T> void ReleaseCom(T*& value) { if (value) { value->Release(); value = nullptr; } }
@@ -688,8 +856,6 @@ void ShutdownRenderer() {
     ReleaseCom(g_d2dFactory);
 }
 
-void PositionAppBar();
-
 void PaintSparkWindow() {
     if (!g_sparkWindow || !InitializeRenderer()) return;
     RECT rect{}; GetClientRect(g_sparkWindow, &rect);
@@ -895,7 +1061,8 @@ void ShowAbout() {
         L"PulseWatch — Signal Quiet\n\n"
         L"Telemetria nativa no topo do desktop.\n"
         L"Clique em uma metrica para o historico de 60s.\n"
-        L"Clique direito na bandeja para preferencias.\n\n"
+        L"Clique direito na bandeja para preferencias.\n"
+        L"Em tela cheia (jogo, YouTube, apresentacao) a barra se oculta sozinha.\n\n"
         L"Atalho de emergencia: Ctrl+Alt+Shift+P\n"
         L"Presets: Quiet · Focus · Gaming\n\n"
         L"Cor = estado (amber / coral). Marca = glyph teal.",
@@ -948,6 +1115,7 @@ void ShowTrayMenu(HWND window) {
 }
 
 void PositionAppBar() {
+    if (g_yieldedForFocus || !g_appbarRegistered) return;
     RECT primary{};
     EnumDisplayMonitors(nullptr, nullptr, FindConfiguredMonitor, reinterpret_cast<LPARAM>(&primary));
     if (IsRectEmpty(&primary)) { g_settings.monitorDevice.clear(); EnumDisplayMonitors(nullptr, nullptr, FindConfiguredMonitor, reinterpret_cast<LPARAM>(&primary)); }
@@ -965,15 +1133,17 @@ void PositionAppBar() {
 
 void ApplyPreferences() {
     KillTimer(g_window, kTimer);
+    KillTimer(g_window, kFocusTimer);
     SetTimer(g_window, kTimer, g_settings.refreshMs, nullptr);
+    SetTimer(g_window, kFocusTimer, kFocusPollMs, nullptr);
     SetLayeredWindowAttributes(g_window, 0, g_settings.dark ? 230 : 220, LWA_ALPHA);
     SaveSettings();
-    PositionAppBar();
+    if (!g_yieldedForFocus) PositionAppBar();
     if (g_renderTarget) {
         RECT rect{}; GetClientRect(g_window, &rect);
         g_renderTarget->Resize(D2D1::SizeU(rect.right - rect.left, rect.bottom - rect.top));
     }
-    InvalidateRect(g_window, nullptr, TRUE);
+    if (!g_yieldedForFocus) InvalidateRect(g_window, nullptr, TRUE);
     if (g_sparkWindow) InvalidateRect(g_sparkWindow, nullptr, FALSE);
 }
 
@@ -992,13 +1162,24 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         WriteDiagnostic(nvmlReady ? L"Started Signal Quiet; NVIDIA telemetry available" : L"Started Signal Quiet; NVIDIA telemetry unavailable");
         g_appbarRegistered = SHAppBarMessage(ABM_NEW, &g_appbar) != 0;
         if (!g_appbarRegistered) { WriteDiagnostic(L"AppBar registration failed"); return -1; }
-        PositionAppBar(); SetTimer(window, kTimer, g_settings.refreshMs, nullptr);
+        PositionAppBar();
+        SetTimer(window, kTimer, g_settings.refreshMs, nullptr);
+        SetTimer(window, kFocusTimer, kFocusPollMs, nullptr);
+        InstallFocusHooks();
         SaveSettings();
         return 0;
     }
+    case kFocusCheckMessage:
+        UpdateFocusYield();
+        return 0;
     case WM_TIMER:
+        if (wParam == kFocusTimer) {
+            UpdateFocusYield();
+            return 0;
+        }
         Sample();
         if (++g_gpuCountdown >= 2) { g_gpuCountdown = 0; SampleGpu(); }
+        if (g_yieldedForFocus) return 0;
         if (g_sparkWindow && g_sparkMetric != MetricId::Count) {
             CopySeriesChronological(g_sparkMetric, g_sparkSeries, g_sparkSeriesCount);
             InvalidateRect(g_sparkWindow, nullptr, FALSE);
@@ -1049,8 +1230,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (lParam == WM_LBUTTONDBLCLK) DestroyWindow(window);
         if (lParam == WM_LBUTTONUP) ShowAbout();
         return 0;
-    case kAppBarMessage: if (lParam == ABN_POSCHANGED) PositionAppBar(); return 0;
-    case WM_DISPLAYCHANGE: PositionAppBar(); return 0;
+    case kAppBarMessage: if (!g_yieldedForFocus && lParam == ABN_POSCHANGED) PositionAppBar(); return 0;
+    case WM_DISPLAYCHANGE: if (!g_yieldedForFocus) PositionAppBar(); return 0;
     case WM_PAINT: { PAINTSTRUCT paint{}; BeginPaint(window, &paint); PaintDirect2D(); EndPaint(window, &paint); return 0; }
     case WM_SIZE:
         if (g_renderTarget) g_renderTarget->Resize(D2D1::SizeU(LOWORD(lParam), HIWORD(lParam)));
@@ -1067,7 +1248,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_CLOSE: DestroyWindow(window); return 0;
     case WM_DESTROY:
         CloseSparkWindow();
-        KillTimer(window, kTimer); UnregisterHotKey(window, kExitHotkey);
+        RemoveFocusHooks();
+        KillTimer(window, kTimer); KillTimer(window, kFocusTimer); UnregisterHotKey(window, kExitHotkey);
         Shell_NotifyIconW(NIM_DELETE, &g_tray); if (g_pulseIcon) DestroyIcon(g_pulseIcon);
         RemoveAppBar(); ShutdownNvml(); ShutdownRenderer(); WriteDiagnostic(L"Stopped"); PostQuitMessage(0); return 0;
     }
